@@ -360,16 +360,19 @@ class AkshareFetcher(BaseFetcher):
         """
         获取普通 A 股历史数据
 
-        策略：
-        1. 优先尝试东方财富接口 (ak.stock_zh_a_hist)
-        2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
-        3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
+        策略（2026-03-27 更新）：
+        东方财富接口被 TCP 层封锁，调整优先级：
+        1. 优先尝试新浪财经接口 (ak.stock_zh_a_daily) ✅ 可用
+        2. 失败后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx) ✅ 可用
+        3. 最后尝试东方财富接口 (ak.stock_zh_a_hist) ⚠️ 可能被封
         """
         # 尝试列表
+        # 注意：东方财富接口被 TCP 层封锁 (2026-03-27)
+        # 优先使用新浪/腾讯接口
         methods = [
-            (self._fetch_stock_data_em, "东方财富"),
             (self._fetch_stock_data_sina, "新浪财经"),
             (self._fetch_stock_data_tx, "腾讯财经"),
+            (self._fetch_stock_data_em, "东方财富(可能被封)"),
         ]
 
         last_error = None
@@ -525,7 +528,9 @@ class AkshareFetcher(BaseFetcher):
         """
         获取 ETF 基金历史数据
         
-        数据来源：ak.fund_etf_hist_em()
+        数据来源（2026-03-27 更新）：
+        - 新浪财经接口 (ak.fund_etf_hist_sina) ✅ 可用
+        - 东方财富接口 (ak.fund_etf_hist_em) ⚠️ 可能被封
         
         Args:
             stock_code: ETF 代码，如 '512400', '159883'
@@ -534,6 +539,92 @@ class AkshareFetcher(BaseFetcher):
             
         Returns:
             ETF 历史数据 DataFrame
+        """
+        # 注意：东方财富接口被 TCP 层封锁 (2026-03-27)
+        # 优先使用新浪接口
+        methods = [
+            (self._fetch_etf_data_sina, "新浪财经"),
+            (self._fetch_etf_data_em, "东方财富(可能被封)"),
+        ]
+        
+        last_error = None
+        for fetch_method, source_name in methods:
+            try:
+                logger.info(f"[数据源] 尝试使用 {source_name} 获取 ETF {stock_code}...")
+                df = fetch_method(stock_code, start_date, end_date)
+                if df is not None and not df.empty:
+                    logger.info(f"[数据源] {source_name} 获取成功")
+                    return df
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[数据源] {source_name} 获取失败: {e}")
+        
+        raise DataFetchError(f"Akshare ETF 所有渠道获取失败: {last_error}")
+    
+    def _fetch_etf_data_sina(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取 ETF 基金历史数据 (新浪财经)
+        数据来源：ak.fund_etf_hist_sina()
+        
+        注意：新浪接口返回全部历史数据，需要按日期过滤
+        """
+        import akshare as ak
+        
+        self._enforce_rate_limit()
+        
+        # 转换代码格式：sh510050, sz159915
+        symbol = _to_sina_tx_symbol(stock_code)
+        
+        logger.info(f"[API调用] ak.fund_etf_hist_sina(symbol={symbol})")
+        
+        try:
+            import time as _time
+            api_start = _time.time()
+            
+            # 新浪接口返回全部历史数据
+            df = ak.fund_etf_hist_sina(symbol=symbol)
+            
+            api_elapsed = _time.time() - api_start
+            
+            if df is not None and not df.empty:
+                logger.info(f"[API返回] ak.fund_etf_hist_sina 成功: {len(df)} 行, 耗时 {api_elapsed:.2f}s")
+                
+                # 标准化列名
+                # 新浪返回：date, prevclose, open, high, low, close, volume, amount
+                rename_map = {
+                    'date': '日期', 'open': '开盘', 'high': '最高',
+                    'low': '最低', 'close': '收盘', 'volume': '成交量',
+                    'amount': '成交额'
+                }
+                df = df.rename(columns=rename_map)
+                
+                # 按日期过滤
+                start_dt = start_date.replace('-', '')
+                end_dt = end_date.replace('-', '')
+                if '日期' in df.columns:
+                    df['日期_str'] = df['日期'].astype(str).str.replace('-', '')
+                    df = df[(df['日期_str'] >= start_dt) & (df['日期_str'] <= end_dt)]
+                    df = df.drop(columns=['日期_str'])
+                
+                # 计算涨跌幅
+                if '收盘' in df.columns:
+                    df['涨跌幅'] = df['收盘'].pct_change() * 100
+                    df['涨跌幅'] = df['涨跌幅'].fillna(0)
+                
+                return df
+            else:
+                logger.warning(f"[API返回] ak.fund_etf_hist_sina 返回空数据")
+                return pd.DataFrame()
+                
+        except Exception as e:
+            raise e
+    
+    def _fetch_etf_data_em(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取 ETF 基金历史数据 (东方财富)
+        数据来源：ak.fund_etf_hist_em()
+        
+        注意：该接口可能被 TCP 层封锁
         """
         import akshare as ak
         
@@ -576,9 +667,9 @@ class AkshareFetcher(BaseFetcher):
             error_msg = str(e).lower()
             
             # 检测反爬封禁
-            if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
+            if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制', 'connection aborted', 'remotedisconnected']):
                 logger.warning(f"检测到可能被封禁: {e}")
-                raise RateLimitError(f"Akshare 可能被限流: {e}") from e
+                raise RateLimitError(f"Akshare(EM) 可能被限流或封禁: {e}") from e
             
             raise DataFetchError(f"Akshare 获取 ETF 数据失败: {e}") from e
     
